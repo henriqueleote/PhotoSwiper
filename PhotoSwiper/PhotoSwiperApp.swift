@@ -4,9 +4,10 @@
 // Value: "Photo Swiper needs access to your photos to help you organize and delete unwanted images."
 import SwiftUI
 import Photos
+import RealmSwift
 
 @main
-struct PhotoSwiperApp: App {
+struct PhotoSwiperApp: SwiftUI.App {
     @StateObject private var photoManager = PhotoManager()
     
     var body: some Scene {
@@ -24,8 +25,25 @@ struct PhotoSwiperApp: App {
 class PhotoManager: ObservableObject {
     @Published var photos: [PhotoAsset] = []
     @Published var markedForDeletion: [PhotoAsset] = []
+    @Published var likedPhotoIDs: Set<String> = []
     @Published var currentIndex: Int = 0
     @Published var hasPermission: Bool = false
+    
+    private let likedPhotosLocalStorageKey = "PhotoSwiper-LocalLikedPhoto"
+    
+    // Initializer to load liked photos from UserDefaults
+    init() {
+        if let storedLikedIDs = UserDefaults.standard.stringArray(forKey: likedPhotosLocalStorageKey) {
+            self.likedPhotoIDs = Set(storedLikedIDs)
+        }
+        
+        // Optional: Perform Realm migrations if needed
+        let config = Realm.Configuration(
+            schemaVersion: 1, // Increment if you change your Realm schema
+            migrationBlock: { migration, oldSchemaVersion in
+            })
+        Realm.Configuration.defaultConfiguration = config
+    }
     
     enum SortOrder {
         case oldToNew
@@ -37,16 +55,12 @@ class PhotoManager: ObservableObject {
         PHPhotoLibrary.requestAuthorization { status in
             DispatchQueue.main.async {
                 self.hasPermission = status == .authorized
-                if self.hasPermission {
-                    print("Photo access granted")
-                }
             }
         }
     }
     
     func loadPhotos(sortOrder: SortOrder) {
         guard hasPermission else { return }
-        print("Loading photos with sort order: \(sortOrder)")
         
         let fetchOptions = PHFetchOptions()
         
@@ -63,105 +77,137 @@ class PhotoManager: ObservableObject {
         
         // Fetch only photos, not videos or other media types
         let fetchResult = PHAsset.fetchAssets(with: .image, options: fetchOptions)
-        print("Found \(fetchResult.count) total photos")
         
-        var newPhotos: [PhotoAsset] = []
+        // Create an array with the actual photos from PhotoAsset
+        var allPhotos: [PhotoAsset] = []
         fetchResult.enumerateObjects { asset, index, stop in
-            newPhotos.append(PhotoAsset(asset: asset))
+            allPhotos.append(PhotoAsset(asset: asset))
         }
         
+        // Shuffle if needed
         if case .random = sortOrder {
-            newPhotos.shuffle()
+            allPhotos.shuffle()
         }
+        
+        // Load likedIDs from Realm *inside* loadPhotos()
+        var likedIDs: Set<String> = []
+        do {
+            let realm = try Realm()
+            let likedObjects = realm.objects(LikedPhotoObject.self)
+            likedIDs = Set(likedObjects.map { $0.id })  // Get fresh IDs from Realm!
+        } catch {
+            print("Error loading liked photos from Realm: \(error)")
+        }
+        
+        allPhotos = allPhotos.filter { !likedIDs.contains($0.id) }
         
         DispatchQueue.main.async {
-            self.photos = newPhotos
+            self.photos = allPhotos
             self.currentIndex = 0
             self.markedForDeletion = []
-            print("Loaded \(newPhotos.count) photos successfully")
         }
     }
     
     func markCurrentPhotoForDeletion() {
         guard currentIndex < photos.count else {
-            print("Error: Current index out of bounds")
             return
         }
         
         let photo = photos[currentIndex]
         if !markedForDeletion.contains(where: { $0.id == photo.id }) {
             markedForDeletion.append(photo)
-            print("Marked photo at index \(currentIndex) for deletion. Total: \(markedForDeletion.count)")
         }
         
         moveToNextPhoto()
     }
     
+    func markCurrentPhotoAsLiked() {
+        guard currentIndex < photos.count else {
+            return
+        }
+        
+        let photo = photos[currentIndex]
+        do {
+            let realm = try Realm()
+            try realm.write {
+                // Check if it's already in Realm to prevent duplicates if primaryKey was not set
+                // With primaryKey, 'add' will automatically update if object exists.
+                realm.add(LikedPhotoObject(id: photo.id), update: .modified)
+            }
+            
+            // if a liked photo should no longer be in those categories.
+            if let index = markedForDeletion.firstIndex(where: { $0.id == photo.id }) {
+                markedForDeletion.remove(at: index)
+            }
+            
+            moveToNextPhoto()
+            
+        } catch {
+            print("Error saving liked photo to Realm: \(error)")
+        }
+    }
+    
     func moveToNextPhoto() {
         if currentIndex < photos.count - 1 {
-            print("Moving from photo \(currentIndex) to \(currentIndex + 1)")
             currentIndex += 1
-        } else {
-            print("Reached end of photos at index \(currentIndex)")
+        }
+    }
+    
+    func moveToPreviousPhoto() {
+        if currentIndex > 0 {
+            currentIndex -= 1
+            print(photos[currentIndex].id)
         }
     }
     
     func confirmDeletion(completion: @escaping (Bool) -> Void) {
         guard !markedForDeletion.isEmpty else {
-            print("No photos marked for deletion")
             completion(true)
             return
         }
         
         // Create array of PHAssets to delete
         let assetsToDelete = markedForDeletion.compactMap { $0.asset } as NSArray
-        print("Attempting to delete \(assetsToDelete.count) photos")
         
         PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(assetsToDelete)
         } completionHandler: { success, error in
             DispatchQueue.main.async {
                 if success {
-                    print("Successfully deleted photos")
                     self.markedForDeletion = []
-                } else if let error = error {
-                    print("Error deleting photos: \(error.localizedDescription)")
                 }
                 completion(success)
             }
         }
+        
     }
 }
 
 // MARK: - Photo Asset Model
+import Photos // Make sure to import Photos for PHAsset
+
 struct PhotoAsset: Identifiable, Equatable {
-    let id = UUID()
+    // The 'id' property should be the PHAsset's localIdentifier (a String)
+    // This provides a unique and persistent identifier for the photo in the library.
+    let id: String
+    
     let asset: PHAsset
     
+    // This initializer is crucial. It ensures that when a PhotoAsset is created
+    // from a PHAsset, its 'id' property is correctly set to the PHAsset's
+    // unique localIdentifier.
+    init(asset: PHAsset) {
+        self.asset = asset
+        self.id = asset.localIdentifier // <-- This is where you get the "real image ID"
+    }
+    
+    // The Equatable conformance method remains the same,
+    // as it now correctly compares based on the persistent `id` (localIdentifier).
     static func == (lhs: PhotoAsset, rhs: PhotoAsset) -> Bool {
         return lhs.id == rhs.id
     }
     
-    var thumbnailImage: UIImage? {
-        get async {
-            let manager = PHImageManager.default()
-            let option = PHImageRequestOptions()
-            option.isSynchronous = true
-            
-            var thumbnail: UIImage?
-            let _ = await withCheckedContinuation { continuation in
-                manager.requestImage(for: asset,
-                                     targetSize: CGSize(width: 200, height: 200),
-                                     contentMode: .aspectFit,
-                                     options: option) { image, _ in
-                    thumbnail = image
-                    continuation.resume()
-                }
-            }
-            return thumbnail
-        }
-    }
-    
+    // Gets full image
     var fullImage: UIImage? {
         get async {
             let manager = PHImageManager.default()
@@ -201,6 +247,7 @@ struct ContentView: View {
 }
 
 // MARK: - Permission View
+// TODO - CHECK THIS
 struct PermissionView: View {
     var body: some View {
         VStack(spacing: 20) {
@@ -230,12 +277,26 @@ struct PermissionView: View {
     }
 }
 
-// MARK: - Home View with Three Options
+// MARK: - Home View with Three Options (Buttons)
 struct HomeView: View {
     @EnvironmentObject private var photoManager: PhotoManager
     @State private var selectedAlbum: String?
     @State private var showingAlbumPicker = false
     @State private var navigateToPhotoSwipe = false
+    @State private var showSettingsMenu = false
+    @State private var selection = true
+    
+    func restoreLikedPhotos() {
+        do {
+            let realm = try Realm()
+            try realm.write {
+                let allLikedPhotos = realm.objects(LikedPhotoObject.self)
+                realm.delete(allLikedPhotos)
+            }
+        } catch {
+            print("Error restoring all liked photos from Realm: \(error)")
+        }
+    }
     
     var body: some View {
         VStack(spacing: 30) {
@@ -262,22 +323,21 @@ struct HomeView: View {
                     OptionButton(title: "Random", systemImage: "shuffle")
                 }
                 
-                Button(action: {
-                    showingAlbumPicker = true
-                }) {
-                    OptionButton(title: "Select Album", systemImage: "folder")
-                }
-                .sheet(isPresented: $showingAlbumPicker) {
-                    // Album picker view would go here
-                    Text("Album Picker")
-                        .font(.title)
-                        .padding()
-                }
+                /*Button(action: {
+                 showingAlbumPicker = true
+                 }) {
+                 OptionButton(title: "Select Album", systemImage: "folder")
+                 }
+                 .sheet(isPresented: $showingAlbumPicker) {
+                 // Album picker view would go here
+                 Text("Album Picker")
+                 .font(.title)
+                 .padding()
+                 }*/
             }
             .padding(.horizontal)
         }
         .padding()
-        .navigationBarHidden(true)
         .background(
             NavigationLink(
                 destination: PhotoSwipeView(),
@@ -285,9 +345,24 @@ struct HomeView: View {
                 label: { EmptyView() }
             )
         )
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button(action: {
+                    showSettingsMenu = true
+                }) {
+                    Image(systemName: "gearshape.fill") // Settings icon
+                }
+            }
+        }
+        .confirmationDialog("Select a color", isPresented: $showSettingsMenu,) {
+            Button("Restore liked photos") {
+                restoreLikedPhotos();
+            }
+        }
     }
 }
 
+// MARK: - Button
 struct OptionButton: View {
     let title: String
     let systemImage: String
@@ -322,7 +397,6 @@ struct PhotoSwipeView: View {
     @State private var showFinishConfirmation = false
     @GestureState private var isDragging = false
     @Environment(\.presentationMode) var presentationMode
-    @State private var currentPhotoID = UUID() // Track the current photo identity
     
     var body: some View {
         ZStack {
@@ -346,8 +420,8 @@ struct PhotoSwipeView: View {
                 }
             } else {
                 // Current photo card
-                PhotoCard(photo: photoManager.photos[photoManager.currentIndex], photoID: currentPhotoID)
-                    .id(currentPhotoID) // Force view refresh when photo changes
+                PhotoCard(photo: photoManager.photos[photoManager.currentIndex])
+                    .id(photoManager.photos[photoManager.currentIndex].id) // Force view refresh when photo changes
                     .offset(x: offset.width, y: 0)
                     .rotationEffect(.degrees(Double(offset.width / 20)))
                     .gesture(
@@ -363,11 +437,9 @@ struct PhotoSwipeView: View {
                                     if offset.width < -100 {
                                         //Swipe left - delete
                                         photoManager.markCurrentPhotoForDeletion() // Mark to delete the picture
-                                        currentPhotoID = UUID() // Generate new ID to force view refresh
                                     } else if offset.width > 100 {
                                         // Swipe right - keep
-                                        photoManager.moveToNextPhoto() // Skip the picture
-                                        currentPhotoID = UUID() // Generate new ID to force view refresh
+                                        photoManager.markCurrentPhotoAsLiked() // Skip the picture
                                     }
                                     offset = .zero // Reset offset for the new card
                                 }
@@ -380,7 +452,6 @@ struct PhotoSwipeView: View {
                     
                     HStack(spacing: 20) {
                         Button(action: {
-                            print("Trash tapped!")
                             // Simualate swipe animation
                             withAnimation(.easeOut(duration: 0.3)) { // Short, quick animation
                                 offset = CGSize(width: -500, height: 0) // Swipe left
@@ -390,35 +461,34 @@ struct PhotoSwipeView: View {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                                 withAnimation {
                                     photoManager.markCurrentPhotoForDeletion() // Mark to delete the picture
-                                    currentPhotoID = UUID() // Generate new ID to force view refresh
                                     offset = .zero // Reset offset for the new card
                                 }
                             }
                         }) {
                             Image(systemName: "xmark.circle.fill") // SFSymbol for trash/reject
-                                .font(.largeTitle)
+                                .font(.system(size: 55))
                                 .foregroundColor(.red)
-                                .padding(10)
+                                .padding(0)
                                 .background(Color.white)
+                                .cornerRadius(10)
                                 .clipShape(Circle())
-                                .shadow(radius: 4)
+                        }
+                        
+                        if(false && photoManager.currentIndex > 0){
+                            Button(action: {
+                                photoManager.moveToPreviousPhoto()
+                            }) {
+                                Image(systemName: "arrow.uturn.backward.circle.fill") // SFSymbol for rewind
+                                    .font(.system(size: 55))
+                                    .foregroundColor(.orange)
+                                    .padding(0)
+                                    .background(Color.white)
+                                    .cornerRadius(10)
+                                    .clipShape(Circle())
+                            }
                         }
                         
                         Button(action: {
-                            // Action for rewind button
-                            print("Rewind tapped!")
-                        }) {
-                            Image(systemName: "arrow.uturn.backward.circle.fill") // SFSymbol for rewind
-                                .font(.largeTitle)
-                                .foregroundColor(.orange)
-                                .padding(10)
-                                .background(Color.white)
-                                .clipShape(Circle())
-                                .shadow(radius: 4)
-                        }
-                        
-                        Button(action: {
-                            print("Heart tapped!")
                             // Simualate swipe animation
                             withAnimation(.easeOut(duration: 0.3)) { // Short, quick animation
                                 offset = CGSize(width: 500, height: 0) // Swipe right
@@ -427,30 +497,26 @@ struct PhotoSwipeView: View {
                             //Force swipe event with a delay
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                                 withAnimation {
-                                    photoManager.moveToNextPhoto() // Skip the picture
-                                    currentPhotoID = UUID() // Generate new ID to force view refresh
+                                    photoManager.markCurrentPhotoAsLiked() // Mark to delete the picture
                                     offset = .zero // Reset offset for the new card
                                 }
                             }
                         }) {
                             Image(systemName: "heart.circle.fill") // SFSymbol for heart/like
-                                .font(.largeTitle)
+                                .font(.system(size: 55))
                                 .foregroundColor(.green)
-                                .padding(10)
+                                .padding(0)
                                 .background(Color.white)
+                                .cornerRadius(10)
                                 .clipShape(Circle())
-                                .shadow(radius: 4)
                         }
-                    }
-                    .padding() // Add some padding around the entire stack
-                    .padding(.horizontal, 50)
-                    .padding(.bottom, 30)
+                    }.padding(.vertical, 20)
                 }
             }
         }
         .navigationTitle("Photo Review")
         .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(true) // HIDES THE DEFAULT BACK BUTTON
+        .navigationBarBackButtonHidden(true)  // hide the default Back button
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button(action: {
@@ -465,55 +531,39 @@ struct PhotoSwipeView: View {
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button(action: {
-                    if photoManager.markedForDeletion.count > 0 {
-                        showFinishConfirmation = true
-                    } else {
-                        presentationMode.wrappedValue.dismiss()
+                if photoManager.markedForDeletion.count > 0 {
+                    Button(action: {
+                        if photoManager.markedForDeletion.count > 0 {
+                            photoManager.confirmDeletion { success in
+                                if success {
+                                    presentationMode.wrappedValue.dismiss()
+                                }
+                            }
+                        } else {
+                            presentationMode.wrappedValue.dismiss()
+                        }
+                    }) {
+                        Text("Finish (\(photoManager.markedForDeletion.count))")
+                            .foregroundColor(.red)
                     }
-                }) {
-                    Text("Finish (\(photoManager.markedForDeletion.count))")
-                        .foregroundColor(photoManager.markedForDeletion.count > 0 ? .red : .blue)
                 }
             }
         }
-        .alert(isPresented: $showBackConfirmation) {
-            print(showBackConfirmation)
-            print("--- Alert modifier for Back Confirmation is being evaluated ---")
-            return Alert(
-                title: Text("Go back"),
-                message: Text("You already had \(photoManager.markedForDeletion.count) photos selected. Are you sure you want to go back?"),
-                primaryButton: .destructive(Text("Yes")) {
-                    presentationMode.wrappedValue.dismiss()
-                },
-                secondaryButton: .cancel()
-            )
-        }
-        .alert(isPresented: $showFinishConfirmation) {
-            print("--- Alert modifier for FINISH Confirmation is being evaluated ---")
-            return Alert(
-                title: Text("Confirm deletion"),
-                message: Text("Are you sure you want to delete \(photoManager.markedForDeletion.count) photos? This action cannot be undone."),
-                primaryButton: .destructive(Text("Delete")) {
-                    photoManager.confirmDeletion { success in
-                        if success {
-                            presentationMode.wrappedValue.dismiss()
-                        }
-                    }
-                },
-                secondaryButton: .cancel()
-            )
-        }
-        .onAppear {
-            // Generate new ID to ensure fresh view when screen appears
-            currentPhotoID = UUID()
+        .confirmationDialog("Cancel progress", isPresented: $showBackConfirmation, titleVisibility: .visible) {
+            Button("Yes", role: .destructive) {
+                presentationMode.wrappedValue.dismiss()
+            }
+            Button("No", role: .cancel) {
+                return
+            }
+        } message: {
+            Text("You already had \(photoManager.markedForDeletion.count) photo(s) selected.\nAre you sure you want to lose your progress?")
         }
     }
 }
 
 struct PhotoCard: View {
     let photo: PhotoAsset
-    let photoID: UUID // Added to track identity changes
     @State private var image: UIImage?
     @State private var loadingError = false
     var body: some View {
@@ -550,10 +600,28 @@ struct PhotoCard: View {
                 if let img = await photo.fullImage {
                     image = img
                 } else {
-                    print("ERROR: Failed to load image for photo ID: \(photo.id).")
                     loadingError = true
                 }
             }
         }
     }
 }
+
+/*
+struct PhotoSwipeView_Previews: PreviewProvider {
+    static var previews: some View {
+        // Create a mock PhotoManager for the preview
+        let mockPhotoManager = PhotoManager()
+
+        // Provide some dummy data for 'photos' for the preview
+        // Note: You can't easily create a mock PHAsset.
+        // For previews, you might represent PhotoAsset without a real PHAsset
+        // or use placeholder images. Here, we'll make a simple mock.
+        // For a full app, you'd probably have a way to generate dummy PhotoAsset.
+
+        return NavigationView { // Wrap in NavigationView if your view expects one
+            PhotoSwipeView()
+                .environmentObject(mockPhotoManager)
+        }
+    }
+}*/
