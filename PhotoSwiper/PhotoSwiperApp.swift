@@ -215,6 +215,7 @@ struct PhotoAsset: Identifiable, Equatable {
             option.isSynchronous = true
             option.deliveryMode = .highQualityFormat
             option.resizeMode = .exact
+            option.isNetworkAccessAllowed = true // Crucial for iCloud-only assets
             
             var image: UIImage?
             let _ = await withCheckedContinuation { continuation in
@@ -226,6 +227,7 @@ struct PhotoAsset: Identifiable, Equatable {
                     continuation.resume()
                 }
             }
+            
             return image
         }
     }
@@ -580,7 +582,7 @@ struct PhotoCard: View {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 40))
                         .foregroundColor(.orange)
-                    Text("Could not load image")
+                    Text("Could not load the image.\nPlease try again with internet connection")
                         .padding(.top, 8)
                 }
             } else {
@@ -601,6 +603,7 @@ struct PhotoCard: View {
                     image = img
                 } else {
                     loadingError = true
+                    print("Can't load image: ", photo.id)
                 }
             }
         }
