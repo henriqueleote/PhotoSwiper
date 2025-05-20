@@ -137,7 +137,6 @@ class PhotoManager: ObservableObject {
 struct PhotoAsset: Identifiable, Equatable {
     let id = UUID()
     let asset: PHAsset
-    let creationDate: Date?
     
     static func == (lhs: PhotoAsset, rhs: PhotoAsset) -> Bool {
         return lhs.id == rhs.id
@@ -319,7 +318,8 @@ struct OptionButton: View {
 struct PhotoSwipeView: View {
     @EnvironmentObject private var photoManager: PhotoManager
     @State private var offset: CGSize = .zero
-    @State private var showConfirmation = false
+    @State private var showBackConfirmation = false
+    @State private var showFinishConfirmation = false
     @GestureState private var isDragging = false
     @Environment(\.presentationMode) var presentationMode
     @State private var currentPhotoID = UUID() // Track the current photo identity
@@ -338,14 +338,11 @@ struct PhotoSwipeView: View {
                     Text("You've marked \(photoManager.markedForDeletion.count) photos for deletion")
                         .padding()
                     
-                    Button("Confirm Deletion") {
-                        showConfirmation = true
-                    }
-                    .padding()
-                    .background(Color.red)
-                    .foregroundColor(.white)
-                    .cornerRadius(10)
-                    .disabled(photoManager.markedForDeletion.isEmpty)
+                        .padding()
+                        .background(Color.red)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                        .disabled(photoManager.markedForDeletion.isEmpty)
                 }
             } else {
                 // Current photo card
@@ -432,6 +429,7 @@ struct PhotoSwipeView: View {
                                 withAnimation {
                                     photoManager.moveToNextPhoto() // Skip the picture
                                     currentPhotoID = UUID() // Generate new ID to force view refresh
+                                    offset = .zero // Reset offset for the new card
                                 }
                             }
                         }) {
@@ -457,38 +455,44 @@ struct PhotoSwipeView: View {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button(action: {
                     if photoManager.markedForDeletion.count > 0 {
-                        showConfirmation = true
+                        showBackConfirmation = true
                     } else {
                         presentationMode.wrappedValue.dismiss()
                     }
                 }) {
                     Image(systemName: "chevron.backward") // The back chevron icon
                     Text("Back")
-                        .fontWeight(.semibold)
-                        .foregroundColor(photoManager.markedForDeletion.count > 0 ? .red : .blue)
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button(action: {
                     if photoManager.markedForDeletion.count > 0 {
-                        showConfirmation = true
+                        showFinishConfirmation = true
                     } else {
                         presentationMode.wrappedValue.dismiss()
                     }
                 }) {
-                    Text("Finish")
-                        .fontWeight(.semibold)
+                    Text("Finish (\(photoManager.markedForDeletion.count))")
                         .foregroundColor(photoManager.markedForDeletion.count > 0 ? .red : .blue)
                 }
             }
-            
-            /*ToolbarItem(placement: .navigationBarLeading) {
-             Text("\(photoManager.markedForDeletion.count) selected")
-             }*/
         }
-        .alert(isPresented: $showConfirmation) {
-            Alert(
-                title: Text("Confirm Deletion"),
+        .alert(isPresented: $showBackConfirmation) {
+            print(showBackConfirmation)
+            print("--- Alert modifier for Back Confirmation is being evaluated ---")
+            return Alert(
+                title: Text("Go back"),
+                message: Text("You already had \(photoManager.markedForDeletion.count) photos selected. Are you sure you want to go back?"),
+                primaryButton: .destructive(Text("Yes")) {
+                    presentationMode.wrappedValue.dismiss()
+                },
+                secondaryButton: .cancel()
+            )
+        }
+        .alert(isPresented: $showFinishConfirmation) {
+            print("--- Alert modifier for FINISH Confirmation is being evaluated ---")
+            return Alert(
+                title: Text("Confirm deletion"),
                 message: Text("Are you sure you want to delete \(photoManager.markedForDeletion.count) photos? This action cannot be undone."),
                 primaryButton: .destructive(Text("Delete")) {
                     photoManager.confirmDeletion { success in
@@ -509,7 +513,7 @@ struct PhotoSwipeView: View {
 
 struct PhotoCard: View {
     let photo: PhotoAsset
-    let photoID: UUID  // Added to track identity changes
+    let photoID: UUID // Added to track identity changes
     @State private var image: UIImage?
     @State private var loadingError = false
     var body: some View {
@@ -546,6 +550,7 @@ struct PhotoCard: View {
                 if let img = await photo.fullImage {
                     image = img
                 } else {
+                    print("ERROR: Failed to load image for photo ID: \(photo.id).")
                     loadingError = true
                 }
             }
